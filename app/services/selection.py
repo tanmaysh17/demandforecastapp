@@ -74,6 +74,14 @@ def rank_models(evaluations: list[ModelEvaluation], weights: RankingWeights | No
     return rank_df
 
 
+def compute_ensemble_weights(rank_df: pd.DataFrame, top_n: int = 3) -> dict[str, float]:
+    """Return inverse-sMAPE weights for the top N ranked models."""
+    top = rank_df.head(top_n).copy()
+    inv_smape = 1.0 / (top["smape"].clip(lower=0.01) + 1e-6)
+    total = float(inv_smape.sum())
+    return dict(zip(top["model_id"], (inv_smape / total).values))
+
+
 def build_explanation(selected_row: pd.Series, baseline_row: pd.Series | None, issues: list[str]) -> str:
     model = selected_row["model_id"]
     smape = selected_row["smape"]

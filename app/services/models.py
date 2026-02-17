@@ -21,22 +21,30 @@ def _interval_bounds(
     horizon: int,
     coverage: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Use empirical residual quantiles instead of random-walk sqrt(h) scaling.
-    # This keeps weekly business intervals realistic while still widening modestly with horizon.
+    # Empirical residual quantiles for the base width, with data-driven horizon growth.
+    # Growth rate is derived from lag-1 residual autocorrelation:
+    #   high autocorr → slow uncertainty growth; near white-noise → faster growth.
     r = np.asarray(residuals, dtype=float)
     r = r[np.isfinite(r)]
     if len(r) >= 10:
         base_error = float(np.quantile(np.abs(r), coverage))
+        lag1_autocorr = float(pd.Series(r).autocorr(lag=1))
+        if np.isnan(lag1_autocorr):
+            lag1_autocorr = 0.0
+        lag1_autocorr = max(0.0, min(lag1_autocorr, 0.95))
     else:
         sigma = np.std(r) if len(r) > 1 else np.std(point_forecast) * 0.10
         sigma = max(float(sigma), 1e-6)
         alpha = 1 - coverage
         z = norm.ppf(1 - alpha / 2)
         base_error = z * sigma
+        lag1_autocorr = 0.0
     base_error = max(base_error, 1e-6)
+    # growth_rate in [0.025, 0.5]: low autocorr → faster widening
+    growth_rate = (1.0 - lag1_autocorr) * 0.5
     step = np.arange(horizon, dtype=float)
     denom = max(horizon - 1, 1)
-    growth = 1.0 + 0.35 * (step / denom)
+    growth = 1.0 + growth_rate * (step / denom)
     scale = base_error * growth
     lower = point_forecast - scale
     upper = point_forecast + scale
@@ -140,13 +148,13 @@ def forecast_sarima(train: pd.DataFrame, horizon: int, exog_future: pd.DataFrame
         pred = fit.get_forecast(steps=horizon, exog=exog_future[exog_cols])
     else:
         pred = fit.get_forecast(steps=horizon)
-    point = pred.predicted_mean.values
+    point = np.asarray(pred.predicted_mean)
     conf_80 = pred.conf_int(alpha=0.20)
     conf_95 = pred.conf_int(alpha=0.05)
-    lower_80 = conf_80.iloc[:, 0].values
-    upper_80 = conf_80.iloc[:, 1].values
-    lower_95 = conf_95.iloc[:, 0].values
-    upper_95 = conf_95.iloc[:, 1].values
+    lower_80 = np.asarray(conf_80)[:, 0]
+    upper_80 = np.asarray(conf_80)[:, 1]
+    lower_95 = np.asarray(conf_95)[:, 0]
+    upper_95 = np.asarray(conf_95)[:, 1]
     resid = fit.resid
     dates = pd.date_range(train["date"].max() + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
     return _build_output(
@@ -170,8 +178,23 @@ def forecast_ml_lag(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
     feature_cols = [c for c in usable.columns if c not in ("date", "y")]
     X = usable[feature_cols]
     y = usable["y"]
+
+    # Initial fit to compute feature importances
+    model = RandomForestRegressor(n_estimators=200, random_state=42, min_samples_leaf=3)
+    model.fit(X, y)
+
+    # Prune features with importance below 1% of the max; keep at least 3
+    importances = pd.Series(model.feature_importances_, index=feature_cols)
+    threshold = importances.max() * 0.01
+    keep_cols = importances[importances >= threshold].index.tolist()
+    if len(keep_cols) < 3:
+        keep_cols = importances.nlargest(3).index.tolist()
+
+    # Refit on pruned feature set
+    X = usable[keep_cols]
     model = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3)
     model.fit(X, y)
+    feature_cols = keep_cols
 
     history = train.copy()
     preds = []
@@ -193,10 +216,15 @@ def forecast_ml_lag(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return _build_output("ml_lag_rf", dates, np.array(preds), residuals)
 
 
-def forecast_ensemble(forecasts: list[pd.DataFrame]) -> pd.DataFrame:
+def forecast_ensemble(forecasts: list[pd.DataFrame], weights: list[float] | None = None) -> pd.DataFrame:
+    """Weighted ensemble of forecasts. Defaults to equal weights if none provided."""
+    if weights is None:
+        weights = [1.0 / len(forecasts)] * len(forecasts)
+    w = np.array(weights, dtype=float)
+    w = w / w.sum()
     base = forecasts[0][["date"]].copy()
     for col in ["forecast", "lower_80", "upper_80", "lower_95", "upper_95"]:
-        base[col] = np.mean([f[col].values for f in forecasts], axis=0)
+        base[col] = sum(wi * f[col].values for wi, f in zip(w, forecasts))
     base["model_id"] = "ensemble_top"
     return base
 
