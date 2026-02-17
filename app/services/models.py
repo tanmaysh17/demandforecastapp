@@ -21,20 +21,41 @@ def _interval_bounds(
     horizon: int,
     coverage: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    alpha = 1 - coverage
-    z = norm.ppf(1 - alpha / 2)
-    sigma = np.std(residuals) if len(residuals) > 1 else np.std(point_forecast) * 0.15
-    sigma = max(float(sigma), 1e-6)
-    scale = sigma * np.sqrt(np.arange(1, horizon + 1))
-    lower = point_forecast - z * scale
-    upper = point_forecast + z * scale
+    # Use empirical residual quantiles instead of random-walk sqrt(h) scaling.
+    # This keeps weekly business intervals realistic while still widening modestly with horizon.
+    r = np.asarray(residuals, dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) >= 10:
+        base_error = float(np.quantile(np.abs(r), coverage))
+    else:
+        sigma = np.std(r) if len(r) > 1 else np.std(point_forecast) * 0.10
+        sigma = max(float(sigma), 1e-6)
+        alpha = 1 - coverage
+        z = norm.ppf(1 - alpha / 2)
+        base_error = z * sigma
+    base_error = max(base_error, 1e-6)
+    step = np.arange(horizon, dtype=float)
+    denom = max(horizon - 1, 1)
+    growth = 1.0 + 0.35 * (step / denom)
+    scale = base_error * growth
+    lower = point_forecast - scale
+    upper = point_forecast + scale
     return lower, upper
 
 
-def _build_output(model_id: str, dates: pd.DatetimeIndex, point_forecast: np.ndarray, residuals: np.ndarray) -> pd.DataFrame:
+def _build_output(
+    model_id: str,
+    dates: pd.DatetimeIndex,
+    point_forecast: np.ndarray,
+    residuals: np.ndarray,
+    lower_80: np.ndarray | None = None,
+    upper_80: np.ndarray | None = None,
+    lower_95: np.ndarray | None = None,
+    upper_95: np.ndarray | None = None,
+) -> pd.DataFrame:
     f = np.asarray(point_forecast, dtype=float)
-    l80, u80 = _interval_bounds(f, residuals, len(f), 0.80)
-    l95, u95 = _interval_bounds(f, residuals, len(f), 0.95)
+    l80, u80 = (lower_80, upper_80) if lower_80 is not None and upper_80 is not None else _interval_bounds(f, residuals, len(f), 0.80)
+    l95, u95 = (lower_95, upper_95) if lower_95 is not None and upper_95 is not None else _interval_bounds(f, residuals, len(f), 0.95)
     return pd.DataFrame(
         {
             "date": dates,
@@ -120,9 +141,24 @@ def forecast_sarima(train: pd.DataFrame, horizon: int, exog_future: pd.DataFrame
     else:
         pred = fit.get_forecast(steps=horizon)
     point = pred.predicted_mean.values
+    conf_80 = pred.conf_int(alpha=0.20)
+    conf_95 = pred.conf_int(alpha=0.05)
+    lower_80 = conf_80.iloc[:, 0].values
+    upper_80 = conf_80.iloc[:, 1].values
+    lower_95 = conf_95.iloc[:, 0].values
+    upper_95 = conf_95.iloc[:, 1].values
     resid = fit.resid
     dates = pd.date_range(train["date"].max() + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
-    return _build_output("sarimax", dates, point, resid)
+    return _build_output(
+        "sarimax",
+        dates,
+        point,
+        resid,
+        lower_80=lower_80,
+        upper_80=upper_80,
+        lower_95=lower_95,
+        upper_95=upper_95,
+    )
 
 
 def forecast_ml_lag(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
@@ -174,4 +210,3 @@ def available_models() -> dict[str, Callable[..., pd.DataFrame]]:
         "sarimax": forecast_sarima,
         "ml_lag_rf": forecast_ml_lag,
     }
-
