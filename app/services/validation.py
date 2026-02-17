@@ -35,7 +35,21 @@ def validate_and_prepare(
     target_col: str,
     optional_cols: list[str] | None = None,
     thresholds: ValidationThresholds | None = None,
+    imputation_method: str = "linear",
+    outlier_action: str = "flag",
 ) -> ValidationReport:
+    """Validate and prepare weekly demand data.
+
+    Parameters
+    ----------
+    imputation_method:
+        How to fill missing weeks. One of ``"linear"`` (default, interpolate),
+        ``"ffill"`` (forward-fill then back-fill), or ``"zero"`` (fill with 0).
+    outlier_action:
+        What to do with MAD-detected outliers. One of ``"flag"`` (default,
+        mark but keep), ``"remove"`` (replace with interpolated value), or
+        ``"cap"`` (winsorise to median ± 3.5·MAD).
+    """
     thresholds = thresholds or ValidationThresholds()
     optional_cols = optional_cols or []
     issues: list[ValidationIssue] = []
@@ -87,15 +101,23 @@ def validate_and_prepare(
     )
     missing_weeks = int(weekly[target_col].isna().sum())
     if missing_weeks > 0:
+        method_label = {"linear": "linear interpolation", "ffill": "forward-fill", "zero": "zero-fill"}.get(
+            imputation_method, imputation_method
+        )
         issues.append(
             ValidationIssue(
                 level="warning",
                 check="missing_weeks",
-                message="Missing weekly periods detected and imputed by interpolation.",
-                details={"missing_weeks": missing_weeks},
+                message=f"Missing weekly periods detected and imputed by {method_label}.",
+                details={"missing_weeks": missing_weeks, "imputation_method": imputation_method},
             )
         )
-        weekly[target_col] = weekly[target_col].interpolate(method="linear").bfill().ffill()
+        if imputation_method == "ffill":
+            weekly[target_col] = weekly[target_col].ffill().bfill()
+        elif imputation_method == "zero":
+            weekly[target_col] = weekly[target_col].fillna(0.0)
+        else:
+            weekly[target_col] = weekly[target_col].interpolate(method="linear").bfill().ffill()
 
     negatives = (weekly[target_col] < 0).sum()
     negative_ratio = negatives / max(len(weekly), 1)
@@ -113,15 +135,32 @@ def validate_and_prepare(
     outliers = _mad_outliers(weekly[target_col])
     outlier_ratio = float(outliers.mean()) if len(outliers) else 0.0
     if outlier_ratio > 0:
+        action_label = {"flag": "flagged", "remove": "removed (interpolated)", "cap": "capped at 3.5·MAD"}.get(
+            outlier_action, "flagged"
+        )
         lvl = "warning" if outlier_ratio <= thresholds.max_outlier_ratio else "error"
         issues.append(
             ValidationIssue(
                 level=lvl,
                 check="outliers",
-                message="Outlier points detected with robust MAD method.",
-                details={"outlier_count": int(outliers.sum()), "outlier_ratio": outlier_ratio},
+                message=f"Outlier points detected with robust MAD method and {action_label}.",
+                details={"outlier_count": int(outliers.sum()), "outlier_ratio": outlier_ratio, "outlier_action": outlier_action},
             )
         )
+        if outlier_action == "remove" and outliers.any():
+            weekly.loc[outliers, target_col] = np.nan
+            weekly[target_col] = weekly[target_col].interpolate(method="linear").bfill().ffill()
+            # Recompute outlier mask after removal (now all clean)
+            outliers = pd.Series(False, index=weekly.index)
+        elif outlier_action == "cap" and outliers.any():
+            vals = weekly[target_col].astype(float)
+            median = float(np.median(vals))
+            mad = float(np.median(np.abs(vals - median)))
+            half_range = 3.5 * mad / 0.6745
+            weekly.loc[outliers, target_col] = weekly.loc[outliers, target_col].clip(
+                lower=median - half_range, upper=median + half_range
+            )
+            outliers = pd.Series(False, index=weekly.index)
 
     cp_flags = _change_point_flags(weekly[target_col])
     if cp_flags.any():
@@ -135,12 +174,16 @@ def validate_and_prepare(
         )
 
     history_weeks = len(weekly)
-    if history_weeks < thresholds.min_history_weeks:
+    degraded_mode = history_weeks < thresholds.min_history_weeks
+    if degraded_mode:
         issues.append(
             ValidationIssue(
-                level="error",
+                level="warning",
                 check="sparse_history",
-                message="Insufficient history for robust yearly seasonality.",
+                message=(
+                    "Insufficient history for robust yearly seasonality. "
+                    "Degraded mode: only simple models (Seasonal Naive, Moving Average, Drift) will be available."
+                ),
                 details={"history_weeks": history_weeks, "minimum_recommended": thresholds.min_history_weeks},
             )
         )
@@ -168,6 +211,7 @@ def validate_and_prepare(
         "missing_weeks": missing_weeks,
         "outlier_count": int(outliers.sum()),
         "negative_count": int(negatives),
+        "degraded_mode": degraded_mode,
         "thresholds": asdict(thresholds),
     }
     return ValidationReport(issues=issues, summary=summary, cleaned_df=cleaned)

@@ -53,11 +53,18 @@ def rolling_backtest(
     model_id: str,
     model_fn,
     holdouts: tuple[int, ...] = DEFAULT_HOLDOUTS,
-) -> list[BacktestFoldResult]:
+) -> tuple[list[BacktestFoldResult], list[str]]:
+    """Run rolling time-series backtests.
+
+    Returns (fold_results, errors) where errors is a list of human-readable
+    failure messages for any holdout fold that could not be evaluated.
+    """
     results: list[BacktestFoldResult] = []
+    errors: list[str] = []
     n = len(df)
     for h in holdouts:
         if n <= h + 30:
+            errors.append(f"holdout={h}w skipped: not enough history ({n} rows, need >{h + 30})")
             continue
         train = df.iloc[: n - h].copy()
         test = df.iloc[n - h :].copy()
@@ -78,6 +85,7 @@ def rolling_backtest(
             results[-1].predicted = list(pred["forecast"].astype(float).values)
             results[-1].lower_95 = list(pred["lower_95"].astype(float).values)
             results[-1].upper_95 = list(pred["upper_95"].astype(float).values)
-        except Exception:
+        except Exception as ex:
+            errors.append(f"holdout={h}w failed: {type(ex).__name__}: {ex}")
             continue
-    return results
+    return results, errors

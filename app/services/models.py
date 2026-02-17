@@ -21,22 +21,30 @@ def _interval_bounds(
     horizon: int,
     coverage: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Use empirical residual quantiles instead of random-walk sqrt(h) scaling.
-    # This keeps weekly business intervals realistic while still widening modestly with horizon.
+    # Empirical residual quantiles for the base width, with data-driven horizon growth.
+    # Growth rate is derived from lag-1 residual autocorrelation:
+    #   high autocorr → slow uncertainty growth; near white-noise → faster growth.
     r = np.asarray(residuals, dtype=float)
     r = r[np.isfinite(r)]
     if len(r) >= 10:
         base_error = float(np.quantile(np.abs(r), coverage))
+        lag1_autocorr = float(pd.Series(r).autocorr(lag=1))
+        if np.isnan(lag1_autocorr):
+            lag1_autocorr = 0.0
+        lag1_autocorr = max(0.0, min(lag1_autocorr, 0.95))
     else:
         sigma = np.std(r) if len(r) > 1 else np.std(point_forecast) * 0.10
         sigma = max(float(sigma), 1e-6)
         alpha = 1 - coverage
         z = norm.ppf(1 - alpha / 2)
         base_error = z * sigma
+        lag1_autocorr = 0.0
     base_error = max(base_error, 1e-6)
+    # growth_rate in [0.025, 0.5]: low autocorr → faster widening
+    growth_rate = (1.0 - lag1_autocorr) * 0.5
     step = np.arange(horizon, dtype=float)
     denom = max(horizon - 1, 1)
-    growth = 1.0 + 0.35 * (step / denom)
+    growth = 1.0 + growth_rate * (step / denom)
     scale = base_error * growth
     lower = point_forecast - scale
     upper = point_forecast + scale
@@ -69,22 +77,31 @@ def _build_output(
     )
 
 
-def forecast_seasonal_naive(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
+def forecast_seasonal_naive(
+    train: pd.DataFrame,
+    horizon: int,
+    seasonal_period: int = 52,
+) -> pd.DataFrame:
     series = train["y"].values
-    seasonal_period = 52 if len(series) >= 52 else max(1, len(series))
-    base = series[-seasonal_period:]
+    period = min(seasonal_period, len(series)) if len(series) >= 1 else 1
+    base = series[-period:]
     repeated = np.resize(base, horizon)
     dates = pd.date_range(train["date"].max() + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
-    residuals = series[seasonal_period:] - series[:-seasonal_period] if len(series) > seasonal_period else np.diff(series)
+    residuals = series[period:] - series[:-period] if len(series) > period else np.diff(series)
     return _build_output("seasonal_naive", dates, repeated, residuals)
 
 
-def forecast_moving_average(train: pd.DataFrame, horizon: int, window: int = 13) -> pd.DataFrame:
+def forecast_moving_average(
+    train: pd.DataFrame,
+    horizon: int,
+    window: int = 13,
+) -> pd.DataFrame:
     series = train["y"].values
-    rolling_mean = pd.Series(series).rolling(window=min(window, len(series))).mean().iloc[-1]
+    w = min(window, len(series))
+    rolling_mean = pd.Series(series).rolling(window=w).mean().iloc[-1]
     point = np.full(horizon, rolling_mean)
     dates = pd.date_range(train["date"].max() + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
-    residuals = series - pd.Series(series).rolling(window=min(window, len(series))).mean().bfill().values
+    residuals = series - pd.Series(series).rolling(window=w).mean().bfill().values
     return _build_output("moving_average", dates, point, residuals)
 
 
@@ -100,35 +117,47 @@ def forecast_drift(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return _build_output("drift", dates, point, residuals)
 
 
-def forecast_ets(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
+def forecast_ets(
+    train: pd.DataFrame,
+    horizon: int,
+    damped_trend: bool = True,
+    seasonal_periods: int = 52,
+) -> pd.DataFrame:
     series = train["y"].astype(float).values
-    seasonal = "add" if len(series) >= 104 else None
-    seasonal_periods = 52 if seasonal else None
+    seasonal = "add" if len(series) >= seasonal_periods * 2 else None
+    sp = seasonal_periods if seasonal else None
     model = ExponentialSmoothing(
         series,
         trend="add",
         seasonal=seasonal,
-        seasonal_periods=seasonal_periods,
-        damped_trend=True,
+        seasonal_periods=sp,
+        damped_trend=damped_trend,
         initialization_method="estimated",
     )
     fit = model.fit(optimized=True)
     forecast = fit.forecast(horizon)
     fitted = fit.fittedvalues
-    residuals = series[-len(fitted) :] - fitted
+    residuals = series[-len(fitted):] - fitted
     dates = pd.date_range(train["date"].max() + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
     return _build_output("ets", dates, forecast, residuals)
 
 
-def forecast_sarima(train: pd.DataFrame, horizon: int, exog_future: pd.DataFrame | None = None) -> pd.DataFrame:
+def forecast_sarima(
+    train: pd.DataFrame,
+    horizon: int,
+    exog_future: pd.DataFrame | None = None,
+    order: tuple[int, int, int] = (1, 1, 1),
+    seasonal_order: tuple[int, int, int, int] | None = None,
+) -> pd.DataFrame:
     series = train["y"].astype(float).values
     exog_cols = [c for c in train.columns if c not in ("date", "y")]
     exog = train[exog_cols] if exog_cols else None
-    seasonal_order = (1, 0, 1, 52) if len(series) >= 120 else (0, 0, 0, 0)
+    if seasonal_order is None:
+        seasonal_order = (1, 0, 1, 52) if len(series) >= 120 else (0, 0, 0, 0)
     model = SARIMAX(
         endog=series,
         exog=exog,
-        order=(1, 1, 1),
+        order=order,
         seasonal_order=seasonal_order,
         enforce_stationarity=False,
         enforce_invertibility=False,
@@ -140,13 +169,13 @@ def forecast_sarima(train: pd.DataFrame, horizon: int, exog_future: pd.DataFrame
         pred = fit.get_forecast(steps=horizon, exog=exog_future[exog_cols])
     else:
         pred = fit.get_forecast(steps=horizon)
-    point = pred.predicted_mean.values
+    point = np.asarray(pred.predicted_mean)
     conf_80 = pred.conf_int(alpha=0.20)
     conf_95 = pred.conf_int(alpha=0.05)
-    lower_80 = conf_80.iloc[:, 0].values
-    upper_80 = conf_80.iloc[:, 1].values
-    lower_95 = conf_95.iloc[:, 0].values
-    upper_95 = conf_95.iloc[:, 1].values
+    lower_80 = np.asarray(conf_80)[:, 0]
+    upper_80 = np.asarray(conf_80)[:, 1]
+    lower_95 = np.asarray(conf_95)[:, 0]
+    upper_95 = np.asarray(conf_95)[:, 1]
     resid = fit.resid
     dates = pd.date_range(train["date"].max() + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
     return _build_output(
@@ -161,8 +190,18 @@ def forecast_sarima(train: pd.DataFrame, horizon: int, exog_future: pd.DataFrame
     )
 
 
-def forecast_ml_lag(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    feats = make_lagged_features(train)
+def forecast_ml_lag(
+    train: pd.DataFrame,
+    horizon: int,
+    n_estimators: int = 300,
+    max_lags: int = 52,
+) -> pd.DataFrame:
+    base_lags = [1, 2, 3, 4, 13, 26, 52]
+    lags = tuple(l for l in base_lags if l <= max_lags)
+    if not lags:
+        lags = (1, 2, 3)
+
+    feats = make_lagged_features(train, lags=lags)
     usable = feats.dropna().copy()
     if usable.empty or len(usable) < 30:
         return forecast_moving_average(train, horizon)
@@ -170,13 +209,28 @@ def forecast_ml_lag(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
     feature_cols = [c for c in usable.columns if c not in ("date", "y")]
     X = usable[feature_cols]
     y = usable["y"]
-    model = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3)
+
+    # Initial fit to compute feature importances
+    model = RandomForestRegressor(n_estimators=200, random_state=42, min_samples_leaf=3)
     model.fit(X, y)
+
+    # Prune features with importance below 1% of the max; keep at least 3
+    importances = pd.Series(model.feature_importances_, index=feature_cols)
+    threshold = importances.max() * 0.01
+    keep_cols = importances[importances >= threshold].index.tolist()
+    if len(keep_cols) < 3:
+        keep_cols = importances.nlargest(3).index.tolist()
+
+    # Refit on pruned feature set with user-specified n_estimators
+    X = usable[keep_cols]
+    model = RandomForestRegressor(n_estimators=n_estimators, random_state=42, min_samples_leaf=3)
+    model.fit(X, y)
+    feature_cols = keep_cols
 
     history = train.copy()
     preds = []
     for _ in range(horizon):
-        feat_hist = make_lagged_features(history).dropna()
+        feat_hist = make_lagged_features(history, lags=lags).dropna()
         row = feat_hist.iloc[-1:][feature_cols]
         pred = float(model.predict(row)[0])
         next_date = history["date"].max() + pd.Timedelta(weeks=1)
@@ -193,10 +247,15 @@ def forecast_ml_lag(train: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return _build_output("ml_lag_rf", dates, np.array(preds), residuals)
 
 
-def forecast_ensemble(forecasts: list[pd.DataFrame]) -> pd.DataFrame:
+def forecast_ensemble(forecasts: list[pd.DataFrame], weights: list[float] | None = None) -> pd.DataFrame:
+    """Weighted ensemble of forecasts. Defaults to equal weights if none provided."""
+    if weights is None:
+        weights = [1.0 / len(forecasts)] * len(forecasts)
+    w = np.array(weights, dtype=float)
+    w = w / w.sum()
     base = forecasts[0][["date"]].copy()
     for col in ["forecast", "lower_80", "upper_80", "lower_95", "upper_95"]:
-        base[col] = np.mean([f[col].values for f in forecasts], axis=0)
+        base[col] = sum(wi * f[col].values for wi, f in zip(w, forecasts))
     base["model_id"] = "ensemble_top"
     return base
 
