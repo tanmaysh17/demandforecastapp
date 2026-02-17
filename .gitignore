@@ -28,3 +28,5 @@ Thumbs.db
 # Streamlit
 .streamlit/secrets.toml
 
+# Local app data
+app_data.db
