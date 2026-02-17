@@ -37,6 +37,75 @@ _STATE_DEFAULTS: dict = {
     "auth_username": None,
 }
 
+_CSS = """
+<style>
+/* ── Primary buttons ─────────────────────────────────────────────────── */
+div.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 0.55rem 1.6rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    box-shadow: 0 2px 6px rgba(2, 132, 199, 0.35);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+div.stButton > button[kind="primary"]:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 14px rgba(2, 132, 199, 0.45);
+}
+div.stButton > button[kind="primary"]:active {
+    transform: translateY(0);
+    box-shadow: 0 1px 4px rgba(2, 132, 199, 0.3);
+}
+
+/* ── Secondary / default buttons ────────────────────────────────────── */
+div.stButton > button[kind="secondary"],
+div.stButton > button:not([kind]) {
+    border: 1.5px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 0.45rem 1.2rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+div.stButton > button[kind="secondary"]:hover,
+div.stButton > button:not([kind]):hover {
+    border-color: #0ea5e9;
+    background: #f0f9ff;
+}
+
+/* ── Download buttons ────────────────────────────────────────────────── */
+div.stDownloadButton > button {
+    border-radius: 8px;
+    font-weight: 500;
+}
+
+/* ── Metric tiles ────────────────────────────────────────────────────── */
+div[data-testid="metric-container"] {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 0.75rem 1rem 0.5rem;
+}
+
+/* ── Top account bar divider ─────────────────────────────────────────── */
+.acct-bar {
+    border-bottom: 1px solid #e2e8f0;
+    padding-bottom: 0.4rem;
+    margin-bottom: 0.2rem;
+}
+
+/* ── Sidebar progress ────────────────────────────────────────────────── */
+div[data-testid="stSidebar"] .workflow-step {
+    font-size: 0.82rem;
+    line-height: 1.6;
+}
+</style>
+"""
+
 
 def _init_state() -> None:
     for key, default in _STATE_DEFAULTS.items():
@@ -81,6 +150,36 @@ def _render_auth_wall() -> None:
 
 
 def _render_sidebar() -> None:
+    # ── Workflow progress ──────────────────────────────────────────────────
+    validated = st.session_state.validated
+    forecasts = st.session_state.forecasts
+    rank_df = st.session_state.rank_df
+    selected_model = st.session_state.selected_model
+
+    steps = [
+        ("1. Upload & Mapping", validated is not None),
+        ("2. EDA & Data Health", validated is not None),
+        ("3. Features & Seasonality", validated is not None),
+        ("4. Forecast", bool(forecasts)),
+        ("5. Backtesting", not rank_df.empty),
+        ("6. Explain", selected_model is not None),
+        ("7. Export", not rank_df.empty),
+    ]
+    done_count = sum(1 for _, done in steps if done)
+    pct = done_count / len(steps)
+
+    st.sidebar.markdown("**Workflow Progress**")
+    st.sidebar.progress(pct, text=f"{int(pct * 100)}% complete")
+    step_lines = "\n".join(
+        f"{'✅' if done else '🔴'} {name}" for name, done in steps
+    )
+    st.sidebar.markdown(
+        f"<div class='workflow-step'>{step_lines.replace(chr(10), '<br>')}</div>",
+        unsafe_allow_html=True,
+    )
+    st.sidebar.divider()
+
+    # ── Account ────────────────────────────────────────────────────────────
     st.sidebar.header("Account")
     st.sidebar.write(f"Signed in as `{st.session_state.auth_username}`")
     if st.sidebar.button("Sign out"):
@@ -145,7 +244,17 @@ def setup_page(title: str = "Demand Forecasting Studio") -> None:
     """Call at the top of every page: init state, enforce auth, render sidebar."""
     init_db()
     _init_state()
+    # Inject CSS
+    st.markdown(_CSS, unsafe_allow_html=True)
     if st.session_state.auth_user_id is None:
         _render_auth_wall()
     else:
         _render_sidebar()
+        # Top-right account chip
+        _, acct_col = st.columns([8, 1])
+        with acct_col:
+            st.markdown(
+                f"<div class='acct-bar' style='text-align:right; color:#64748b; font-size:0.8rem;'>"
+                f"👤 {st.session_state.auth_username}</div>",
+                unsafe_allow_html=True,
+            )

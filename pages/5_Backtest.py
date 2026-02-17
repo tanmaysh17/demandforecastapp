@@ -29,7 +29,7 @@ holdout_options = st.multiselect("Holdout windows", options=[13, 26, 52], defaul
 holdouts = tuple(sorted(holdout_options))
 model_map = available_models()
 
-if st.button("Run Backtests"):
+if st.button("Run Backtests", type="primary"):
     fold_map: dict = {}
     all_errors: dict[str, list[str]] = {}
     for model_id in forecasts:
@@ -106,9 +106,20 @@ if not rank_df.empty:
                 "upper_95": fold.upper_95,
             }
         )
+        st.caption(
+            "This chart compares what the model would have predicted vs what actually happened "
+            "during the holdout window. Closer tracking = better in-sample accuracy. "
+            "Wide intervals that capture the actuals = well-calibrated uncertainty."
+        )
         fig_bt = go.Figure()
-        fig_bt.add_trace(go.Scatter(x=bt_df["date"], y=bt_df["actual"], mode="lines", name="Actual"))
-        fig_bt.add_trace(go.Scatter(x=bt_df["date"], y=bt_df["predicted"], mode="lines", name="Predicted"))
+        fig_bt.add_trace(go.Scatter(
+            x=bt_df["date"], y=bt_df["actual"], mode="lines", name="Actual",
+            line=dict(color="#1f2937"),
+        ))
+        fig_bt.add_trace(go.Scatter(
+            x=bt_df["date"], y=bt_df["predicted"], mode="lines", name="Predicted",
+            line=dict(color="#0ea5e9", dash="dash"),
+        ))
         fig_bt.add_trace(
             go.Scatter(x=bt_df["date"], y=bt_df["upper_95"], line=dict(width=0), showlegend=False, hoverinfo="skip")
         )
@@ -123,6 +134,8 @@ if not rank_df.empty:
             )
         )
         fig_bt.update_layout(
-            title=f"Backtest: Predicted vs Actual ({model_for_plot})", template="plotly_white"
+            title=f"Backtest: Predicted vs Actual ({model_for_plot})",
+            template="plotly_white",
+            yaxis=dict(rangemode="tozero"),
         )
         st.plotly_chart(fig_bt, use_container_width=True)

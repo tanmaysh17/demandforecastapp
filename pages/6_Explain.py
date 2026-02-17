@@ -10,6 +10,7 @@ from app.ui.shared import setup_page  # noqa: E402
 setup_page()
 
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 import plotly.express as px  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 
@@ -29,6 +30,10 @@ if selected_model is None:
     selected_model = list(forecasts.keys())[0]
     st.session_state.selected_model = selected_model
 
+# Last actual point used to bridge all forecast traces
+last_date = clean["date"].iloc[-1]
+last_y = float(clean["y"].iloc[-1])
+
 # --- Actuals + all forecasts overlay ---
 fig = go.Figure()
 fig.add_trace(
@@ -36,18 +41,26 @@ fig.add_trace(
 )
 for f in forecasts.values():
     mid = f["model_id"].iloc[0]
-    width = 3 if mid == selected_model else 1
-    fig.add_trace(go.Scatter(x=f["date"], y=f["forecast"], mode="lines", name=mid, line=dict(width=width)))
+    width = 2.5 if mid == selected_model else 1
+    # Bridge: prepend last actual so each model connects from the same anchor
+    bridge_dates = pd.concat([pd.Series([last_date]), f["date"]]).reset_index(drop=True)
+    bridge_y = pd.concat([pd.Series([last_y]), f["forecast"]]).reset_index(drop=True)
+    fig.add_trace(go.Scatter(
+        x=bridge_dates, y=bridge_y, mode="lines", name=mid, line=dict(width=width),
+    ))
 
 sf = forecasts.get(selected_model)
 if sf is not None:
+    bridge_dates_sf = pd.concat([pd.Series([last_date]), sf["date"]]).reset_index(drop=True)
+    bridge_upper = pd.concat([pd.Series([last_y]), sf["upper_95"]]).reset_index(drop=True)
+    bridge_lower = pd.concat([pd.Series([last_y]), sf["lower_95"]]).reset_index(drop=True)
     fig.add_trace(
-        go.Scatter(x=sf["date"], y=sf["upper_95"], line=dict(width=0), showlegend=False, hoverinfo="skip")
+        go.Scatter(x=bridge_dates_sf, y=bridge_upper, line=dict(width=0), showlegend=False, hoverinfo="skip")
     )
     fig.add_trace(
         go.Scatter(
-            x=sf["date"],
-            y=sf["lower_95"],
+            x=bridge_dates_sf,
+            y=bridge_lower,
             fill="tonexty",
             fillcolor="rgba(59,130,246,0.15)",
             line=dict(width=0),
@@ -55,8 +68,19 @@ if sf is not None:
             hoverinfo="skip",
         )
     )
-fig.update_layout(title="Actuals and Forecasts", xaxis_title="Date", yaxis_title="Demand", template="plotly_white")
+fig.update_layout(
+    title="Actuals and Forecasts",
+    xaxis_title="Date",
+    yaxis_title="Demand",
+    template="plotly_white",
+    yaxis=dict(rangemode="tozero"),
+)
 st.plotly_chart(fig, use_container_width=True)
+st.caption(
+    "All forecasts are bridged from the last actual data point. "
+    "The highlighted (thicker) line is the recommended model. "
+    "The shaded band shows the 95% prediction interval for the selected model."
+)
 
 # --- Recommendation rationale ---
 st.markdown("**Model recommendation rationale**")
@@ -73,18 +97,34 @@ if not rank_df.empty:
 # --- Residual diagnostics ---
 selected_folds = st.session_state.fold_map.get(selected_model, [])
 if selected_folds:
+    st.subheader("Residual Diagnostics")
+    st.caption(
+        "Residuals are the differences between what the model predicted and what actually happened "
+        "during the backtest holdout period. "
+        "**Good residuals** look like random noise with no pattern — they should fluctuate around zero. "
+        "**Patterns in residuals** (trends, seasonality) suggest the model is missing something systematic."
+    )
     fold = sorted(selected_folds, key=lambda x: x.holdout_weeks)[-1]
     resid = np.array(fold.actual) - np.array(fold.predicted)
-    resid_df = __import__("pandas").DataFrame({"step": np.arange(1, len(resid) + 1), "residual": resid})
+    resid_df = pd.DataFrame({"step": np.arange(1, len(resid) + 1), "residual": resid})
     st.plotly_chart(
-        px.line(resid_df, x="step", y="residual", title="Residual Diagnostics"), use_container_width=True
+        px.line(resid_df, x="step", y="residual", title="Residuals over Holdout Period")
+        .update_layout(template="plotly_white"),
+        use_container_width=True,
     )
     max_lag = min(20, len(resid) - 1)
     if max_lag > 1:
+        st.caption(
+            "**Residual autocorrelation:** if bars are significant (outside the dashed lines), "
+            "the model is leaving predictable patterns on the table. "
+            "Large spikes at lag 52 → missed seasonality. Large lag-1 spike → consider ARIMA or ML models."
+        )
         acf_vals = [1.0]
         for lag in range(1, max_lag + 1):
             acf_vals.append(float(np.corrcoef(resid[:-lag], resid[lag:])[0, 1]))
-        acf_df = __import__("pandas").DataFrame({"lag": np.arange(0, max_lag + 1), "acf": acf_vals})
+        acf_df = pd.DataFrame({"lag": np.arange(0, max_lag + 1), "acf": acf_vals})
         st.plotly_chart(
-            px.bar(acf_df, x="lag", y="acf", title="Residual Autocorrelation"), use_container_width=True
+            px.bar(acf_df, x="lag", y="acf", title="Residual Autocorrelation")
+            .update_layout(template="plotly_white"),
+            use_container_width=True,
         )

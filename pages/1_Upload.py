@@ -11,6 +11,8 @@ setup_page()
 
 import logging  # noqa: E402
 
+import plotly.express as px  # noqa: E402
+
 from app.core.config import ValidationThresholds  # noqa: E402
 from app.services.data_loader import build_template, infer_columns, read_tabular  # noqa: E402
 from app.services.features import prepare_weekly_exog  # noqa: E402
@@ -56,6 +58,32 @@ if raw_df is not None:
         options=optional_options,
         default=safe_optional_default,
     )
+
+    # --- Demand preview chart (reactive — updates as user changes dropdowns) ---
+    try:
+        preview_df = raw_df[[date_col, target_col]].dropna().copy()
+        preview_df[date_col] = __import__("pandas").to_datetime(preview_df[date_col], errors="coerce")
+        preview_df = preview_df.dropna(subset=[date_col]).sort_values(date_col)
+        if not preview_df.empty:
+            fig_prev = px.line(
+                preview_df,
+                x=date_col,
+                y=target_col,
+                title=f"Preview: {target_col} over time",
+                labels={date_col: "Date", target_col: "Demand"},
+            )
+            fig_prev.update_layout(
+                template="plotly_white",
+                yaxis=dict(rangemode="tozero"),
+                margin=dict(t=40, b=20),
+            )
+            st.plotly_chart(fig_prev, use_container_width=True)
+            st.caption(
+                "This chart updates as you change the column selections above. "
+                "Verify the trend looks as expected before proceeding to validation."
+            )
+    except Exception:
+        pass  # Silently skip if column types aren't compatible yet
 
     # --- Data preparation settings ---
     st.subheader("Data Preparation Settings")
