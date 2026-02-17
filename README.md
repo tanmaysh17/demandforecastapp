@@ -3,6 +3,8 @@
 Production-quality weekly demand forecasting web app for business users.
 
 ## Features
+- User accounts (signup/login) with secure password hashing
+- Per-user saved sessions (save/load/delete) persisted in SQLite
 - Excel upload + column mapping
 - Automated data quality validation:
   - Missing weeks, duplicates, non-numeric values
@@ -27,6 +29,11 @@ Production-quality weekly demand forecasting web app for business users.
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
+
+## Authentication and Session Storage
+- App uses local SQLite database `app_data.db` for users and saved sessions.
+- Passwords are stored as salted PBKDF2-SHA256 hashes.
+- Each signed-in user can save and reload forecasting work-in-progress sessions.
 
 ## Input Schema
 Supported file types:

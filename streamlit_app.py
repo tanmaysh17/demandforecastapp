@@ -14,6 +14,17 @@ from app.services.data_loader import build_template, infer_columns, read_tabular
 from app.services.eda import cagr, compute_growth_metrics, decompose_weekly, detect_seasonality_periods, seasonal_indices, stationarity_indicator
 from app.services.features import build_holiday_features, prepare_weekly_exog
 from app.services.models import available_models, forecast_ensemble
+from app.services.persistence import (
+    authenticate_user,
+    create_user,
+    delete_user_session,
+    deserialize_app_state,
+    get_user_session_payload,
+    init_db,
+    list_user_sessions,
+    save_user_session,
+    serialize_app_state,
+)
 from app.services.reporting import build_forecast_table, build_one_page_summary, export_to_excel
 from app.services.selection import build_explanation, rank_models, summarize_evaluations
 from app.services.validation import validate_and_prepare
@@ -27,15 +38,28 @@ st.title("Demand Forecasting Studio")
 st.caption("Enterprise-ready weekly demand forecasting with validation, backtests, explainability, and export.")
 
 
-def _render_validation_report(report):
+def _normalize_report(report_obj) -> dict:
+    if report_obj is None:
+        return {"summary": {}, "issues": []}
+    if isinstance(report_obj, dict):
+        return {"summary": report_obj.get("summary", {}), "issues": report_obj.get("issues", [])}
+    issues = [
+        {"level": i.level, "check": i.check, "message": i.message, "details": i.details}
+        for i in getattr(report_obj, "issues", [])
+    ]
+    return {"summary": getattr(report_obj, "summary", {}), "issues": issues}
+
+
+def _render_validation_report(report_obj):
+    report = _normalize_report(report_obj)
     sev_color = {"error": "red", "warning": "orange", "info": "blue"}
-    if not report.issues:
+    if not report["issues"]:
         st.success("No data quality issues detected.")
         return
-    for issue in report.issues:
-        color = sev_color.get(issue.level, "gray")
+    for issue in report["issues"]:
+        color = sev_color.get(issue["level"], "gray")
         st.markdown(
-            f"- :{color}[**{issue.level.upper()}**] `{issue.check}`: {issue.message} | Details: `{issue.details}`"
+            f"- :{color}[**{issue['level'].upper()}**] `{issue['check']}`: {issue['message']} | Details: `{issue['details']}`"
         )
 
 
@@ -79,17 +103,7 @@ def _plot_actuals_forecast(history: pd.DataFrame, forecasts: list[pd.DataFrame],
     st.plotly_chart(fig, use_container_width=True)
 
 
-tabs = st.tabs(
-    [
-        "1) Upload & Mapping",
-        "2) EDA & Data Health",
-        "3) Features & Seasonality",
-        "4) Modeling & Forecasting",
-        "5) Backtesting & Accuracy",
-        "6) Explainability",
-        "7) Export & Reporting",
-    ]
-)
+init_db()
 
 if "raw_df" not in st.session_state:
     st.session_state.raw_df = None
@@ -111,6 +125,96 @@ if "audit_trail" not in st.session_state:
     st.session_state.audit_trail = []
 if "holiday_mode" not in st.session_state:
     st.session_state.holiday_mode = "None"
+if "auth_user_id" not in st.session_state:
+    st.session_state.auth_user_id = None
+if "auth_username" not in st.session_state:
+    st.session_state.auth_username = None
+
+if st.session_state.auth_user_id is None:
+    st.subheader("Account Access")
+    left, right = st.columns(2)
+    with left:
+        with st.form("login_form"):
+            st.markdown("**Sign in**")
+            login_user = st.text_input("Username", key="login_user")
+            login_pass = st.text_input("Password", type="password", key="login_pass")
+            if st.form_submit_button("Sign in", type="primary"):
+                ok, user_id = authenticate_user(login_user, login_pass)
+                if ok and user_id is not None:
+                    st.session_state.auth_user_id = user_id
+                    st.session_state.auth_username = login_user.strip()
+                    st.success("Signed in.")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+    with right:
+        with st.form("signup_form"):
+            st.markdown("**Create account**")
+            signup_user = st.text_input("New username", key="signup_user")
+            signup_pass = st.text_input("New password", type="password", key="signup_pass")
+            signup_pass2 = st.text_input("Confirm password", type="password", key="signup_pass2")
+            if st.form_submit_button("Create account"):
+                if signup_pass != signup_pass2:
+                    st.error("Passwords do not match.")
+                else:
+                    ok, msg = create_user(signup_user, signup_pass)
+                    if ok:
+                        st.success(msg + " Please sign in.")
+                    else:
+                        st.error(msg)
+    st.stop()
+
+st.sidebar.header("Account")
+st.sidebar.write(f"Signed in as `{st.session_state.auth_username}`")
+if st.sidebar.button("Sign out"):
+    st.session_state.auth_user_id = None
+    st.session_state.auth_username = None
+    st.rerun()
+
+st.sidebar.markdown("**Saved Sessions**")
+save_name = st.sidebar.text_input("Session name", value="default")
+if st.sidebar.button("Save current session"):
+    payload = serialize_app_state(dict(st.session_state))
+    save_user_session(st.session_state.auth_user_id, save_name.strip() or "default", payload)
+    st.sidebar.success("Session saved.")
+
+saved = list_user_sessions(st.session_state.auth_user_id)
+if saved:
+    session_labels = [f"{x['session_name']} ({x['updated_at']})" for x in saved]
+    idx = st.sidebar.selectbox("Saved runs", options=list(range(len(saved))), format_func=lambda i: session_labels[i])
+    col_a, col_b = st.sidebar.columns(2)
+    if col_a.button("Load selected"):
+        payload = get_user_session_payload(st.session_state.auth_user_id, saved[idx]["id"])
+        if payload:
+            restored = deserialize_app_state(payload)
+            st.session_state.raw_df = restored["raw_df"]
+            st.session_state.validated = restored["validated"]
+            st.session_state.forecasts = restored["forecasts"] or {}
+            st.session_state.rank_df = restored["rank_df"] if restored["rank_df"] is not None else pd.DataFrame()
+            st.session_state.explanation = restored["explanation"]
+            st.session_state.selected_model = restored["selected_model"]
+            st.session_state.adjusted_forecasts = restored["adjusted_forecasts"] or {}
+            st.session_state.audit_trail = restored["audit_trail"] or []
+            st.session_state.holiday_mode = restored["holiday_mode"] or "None"
+            st.session_state.fold_map = {}
+            st.sidebar.success("Session loaded.")
+            st.rerun()
+    if col_b.button("Delete selected"):
+        delete_user_session(st.session_state.auth_user_id, saved[idx]["id"])
+        st.sidebar.success("Session deleted.")
+        st.rerun()
+
+tabs = st.tabs(
+    [
+        "1) Upload & Mapping",
+        "2) EDA & Data Health",
+        "3) Features & Seasonality",
+        "4) Modeling & Forecasting",
+        "5) Backtesting & Accuracy",
+        "6) Explainability",
+        "7) Export & Reporting",
+    ]
+)
 
 with tabs[0]:
     st.subheader("Upload Weekly Data")
@@ -167,13 +271,13 @@ with tabs[1]:
     if not validated:
         st.info("Upload and validate data first.")
     else:
-        report = validated["report"]
+        report = _normalize_report(validated.get("report"))
         clean = validated["clean_df"]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("History (weeks)", report.summary["history_weeks"])
-        c2.metric("Missing weeks", report.summary["missing_weeks"])
-        c3.metric("Outliers", report.summary["outlier_count"])
-        c4.metric("Negative values", report.summary["negative_count"])
+        c1.metric("History (weeks)", report["summary"].get("history_weeks"))
+        c2.metric("Missing weeks", report["summary"].get("missing_weeks"))
+        c3.metric("Outliers", report["summary"].get("outlier_count"))
+        c4.metric("Negative values", report["summary"].get("negative_count"))
         _render_validation_report(report)
 
         fig = px.line(clean, x="date", y="y", title="Demand Trend")
@@ -228,8 +332,8 @@ with tabs[3]:
         st.caption(f"Holiday mode selected: {holiday_mode}. Calendar effects are applied through exogenous regressors when provided.")
 
         if st.button("Generate Forecasts", type="primary"):
-            report = validated["report"]
-            has_blocking_quality = any(i.level == "error" for i in report.issues)
+            report = _normalize_report(validated.get("report"))
+            has_blocking_quality = any(i["level"] == "error" for i in report["issues"])
             if has_blocking_quality and auto_mode:
                 selected_models = ["seasonal_naive", "moving_average", "drift", "ets"]
                 st.warning("Data quality issues detected. Auto mode switched to robust model subset.")
@@ -314,7 +418,8 @@ with tabs[4]:
                 top_model = rank_df.iloc[0]["model_id"]
                 st.session_state.selected_model = top_model
                 base_row = baseline_candidates.iloc[0] if not baseline_candidates.empty else None
-                issues = [f"{i.check}:{i.message}" for i in validated["report"].issues]
+                report = _normalize_report(validated.get("report"))
+                issues = [f"{i['check']}:{i['message']}" for i in report["issues"]]
                 st.session_state.explanation = build_explanation(rank_df.iloc[0], base_row, issues)
             else:
                 st.warning("No valid backtest results; consider shorter holdouts or more history.")
@@ -435,14 +540,17 @@ with tabs[6]:
             selected_model=selected_model,
             horizon=len(forecast_df),
             rank_df=rank_df,
-            validation_summary=validated["report"].summary,
+            validation_summary=_normalize_report(validated.get("report"))["summary"],
             explanation=st.session_state.explanation,
             growth_outlook={
                 "wow_growth_latest": float(growth["wow_growth"].dropna().iloc[-1]) if not growth["wow_growth"].dropna().empty else None,
                 "trailing_52w_growth_latest": float(growth["trailing_52w_growth"].dropna().iloc[-1]) if not growth["trailing_52w_growth"].dropna().empty else None,
             },
         )
-        issues_df = pd.DataFrame([{"level": i.level, "check": i.check, "message": i.message, "details": str(i.details)} for i in validated["report"].issues])
+        report = _normalize_report(validated.get("report"))
+        issues_df = pd.DataFrame(
+            [{"level": i["level"], "check": i["check"], "message": i["message"], "details": str(i["details"])} for i in report["issues"]]
+        )
         audit_df = pd.DataFrame(st.session_state.audit_trail)
 
         st.dataframe(forecast_table.tail(30), use_container_width=True)
