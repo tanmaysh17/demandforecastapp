@@ -305,15 +305,23 @@ for sname, sc in built_scenarios.items():
         mode="lines", name=sname,
         line=dict(color=sc["color"], width=2.5),
     ))
-fig_w.add_vline(
-    x=horizon_date.isoformat(), line_dash="dash", line_color="#94a3b8",
-    annotation_text="Uptake horizon", annotation_position="top right",
+_vline_shape = dict(
+    type="line", xref="x", yref="paper",
+    x0=horizon_date, x1=horizon_date, y0=0, y1=1,
+    line=dict(dash="dash", color="#94a3b8", width=1.5),
 )
 fig_w.update_layout(
     xaxis_title="Date", yaxis_title="Weekly Demand (units)",
     template="plotly_white", yaxis=dict(rangemode="tozero"),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     margin=dict(t=40, b=20),
+    shapes=[_vline_shape],
+    annotations=[dict(
+        x=horizon_date, y=1, xref="x", yref="paper",
+        text="Uptake horizon", showarrow=False,
+        xanchor="left", yanchor="top",
+        font=dict(color="#94a3b8", size=11),
+    )],
 )
 st.plotly_chart(fig_w, use_container_width=True)
 
@@ -331,13 +339,13 @@ for sname, sc in built_scenarios.items():
         mode="lines", name=sname,
         line=dict(color=sc["color"], width=2.5),
     ))
-fig_pct.add_vline(x=horizon_date.isoformat(), line_dash="dash", line_color="#94a3b8")
 fig_pct.update_layout(
     xaxis_title="Date", yaxis_title="% of Peak Demand",
     template="plotly_white",
     yaxis=dict(range=[0, 110], ticksuffix="%"),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     margin=dict(t=40, b=20),
+    shapes=[_vline_shape],
 )
 st.plotly_chart(fig_pct, use_container_width=True)
 
