@@ -37,6 +37,11 @@ def init_db(db_path: str = "app_data.db") -> None:
             )
             """
         )
+        # Ensure the anonymous user (id=1) always exists for save/load without auth
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, username, password_hash, created_at) VALUES (1, 'anonymous', '', ?)",
+            (datetime.utcnow().isoformat(),),
+        )
         conn.commit()
     finally:
         conn.close()
